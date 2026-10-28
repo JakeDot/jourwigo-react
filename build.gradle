@@ -1,0 +1,11 @@
+plugins {
+    id 'base'
+}
+
+task assembleDebug(type: Exec) {
+    commandLine 'npm', 'run', 'build'
+}
+
+task lint(type: Exec) {
+    commandLine 'npm', 'run', 'lint'
+}
