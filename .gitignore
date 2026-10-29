@@ -29,3 +29,7 @@ replay_pid*
 
 # Ignore Gradle build output directory
 build
+
+# Node dependencies & build output
+node_modules/
+dist/
