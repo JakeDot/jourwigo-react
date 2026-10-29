@@ -26,25 +26,180 @@ export function formatPropertyValue(val: string, type: PropertyType): string {
   return `"${escapeLua(val)}"`;
 }
 
-/**
- * Topologically sort objects so that containers / parents are declared before children
- */
-export function getSortedObjects(objects: WherigoObject[]): WherigoObject[] {
-  const sorted: WherigoObject[] = [];
-  const visited = new Set<string>();
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-  function visit(obj: WherigoObject | undefined) {
-    if (!obj || visited.has(obj.id)) return;
-    if (obj.parentId) {
-      const parent = objects.find((o) => o.id === obj.parentId);
-      if (parent) visit(parent);
+export function isMediaObject(obj: WherigoObject): boolean {
+  return Boolean(obj.template && obj.template.startsWith('Media'));
+}
+
+interface ObjectDependency {
+  targetId: string;
+  propKey?: string;
+}
+
+function getObjectDependencies(
+  obj: WherigoObject,
+  objects: WherigoObject[],
+  idMap: Map<string, WherigoObject>,
+  varMap: Map<string, WherigoObject>
+): ObjectDependency[] {
+  const deps: ObjectDependency[] = [];
+  const added = new Set<string>();
+
+  function addDep(targetId: string, propKey?: string) {
+    if (!targetId || targetId === obj.id) return;
+    const key = `${targetId}:${propKey || ''}`;
+    if (!added.has(key)) {
+      added.add(key);
+      deps.push({ targetId, propKey });
     }
-    visited.add(obj.id);
-    sorted.push(obj);
   }
 
-  objects.forEach((o) => visit(o));
-  return sorted;
+  // 1. Parent dependency
+  if (obj.parentId && idMap.has(obj.parentId)) {
+    addDep(obj.parentId, 'Container');
+  }
+
+  // 2. Property dependencies
+  obj.props.forEach((p) => {
+    if (!p.k || !p.v) return;
+    const vTrim = p.v.trim();
+
+    // Direct varName match
+    const targetDirect = varMap.get(vTrim);
+    if (targetDirect) {
+      addDep(targetDirect.id, p.k);
+      return;
+    }
+
+    // Expression / identifier search
+    objects.forEach((candidate) => {
+      if (candidate.id === obj.id) return;
+      const regex = new RegExp(`\\b${escapeRegex(candidate.varName)}\\b`);
+      if (regex.test(p.v)) {
+        addDep(candidate.id, p.k);
+      }
+    });
+  });
+
+  // 3. Relations dependencies
+  if (obj.relations) {
+    obj.relations.forEach((rel) => {
+      const target = idMap.get(rel.targetId);
+      if (!target) return;
+      if (rel.relationType === 'CONTAINS') {
+        // Container relation where target is child
+      } else {
+        addDep(target.id);
+      }
+    });
+  }
+
+  // Check if any object contains obj
+  objects.forEach((other) => {
+    if (other.id === obj.id) return;
+    if (other.relations) {
+      other.relations.forEach((rel) => {
+        if (rel.targetId === obj.id && rel.relationType === 'CONTAINS') {
+          addDep(other.id, 'Container');
+        }
+      });
+    }
+  });
+
+  return deps;
+}
+
+export interface ProcessedLuaObjects {
+  orderedObjects: WherigoObject[];
+  deferredAssignments: Array<{ varName: string; propKey: string; propVal: string; propType: PropertyType }>;
+}
+
+export function processObjectsForLua(objects: WherigoObject[]): ProcessedLuaObjects {
+  const idMap = new Map<string, WherigoObject>();
+  const varMap = new Map<string, WherigoObject>();
+  objects.forEach((o) => {
+    idMap.set(o.id, o);
+    varMap.set(o.varName, o);
+  });
+
+  const UNVISITED = 0;
+  const VISITING = 1;
+  const VISITED = 2;
+
+  const state = new Map<string, number>();
+  objects.forEach((o) => state.set(o.id, UNVISITED));
+
+  const orderedObjects: WherigoObject[] = [];
+  const deferredSet = new Set<string>(); // "objId:propKey"
+  const deferredAssignments: Array<{ varName: string; propKey: string; propVal: string; propType: PropertyType }> = [];
+
+  function visit(obj: WherigoObject) {
+    state.set(obj.id, VISITING);
+
+    const deps = getObjectDependencies(obj, objects, idMap, varMap);
+    deps.forEach((dep) => {
+      const depObj = idMap.get(dep.targetId);
+      if (!depObj) return;
+
+      const depState = state.get(depObj.id) ?? UNVISITED;
+      if (depState === VISITING) {
+        // Cycle detected! Defer this property
+        if (dep.propKey) {
+          deferredSet.add(`${obj.id}:${dep.propKey}`);
+        }
+      } else if (depState === UNVISITED) {
+        visit(depObj);
+      }
+    });
+
+    state.set(obj.id, VISITED);
+    orderedObjects.push(obj);
+  }
+
+  // To hoist Media objects: process Media objects first, then remaining objects
+  const mediaObjects = objects.filter((o) => isMediaObject(o));
+  const nonMediaObjects = objects.filter((o) => !isMediaObject(o));
+
+  mediaObjects.forEach((o) => {
+    if (state.get(o.id) === UNVISITED) {
+      visit(o);
+    }
+  });
+
+  nonMediaObjects.forEach((o) => {
+    if (state.get(o.id) === UNVISITED) {
+      visit(o);
+    }
+  });
+
+  // Extract deferred property assignments
+  objects.forEach((obj) => {
+    obj.props.forEach((p) => {
+      if (p.k && deferredSet.has(`${obj.id}:${p.k}`)) {
+        deferredAssignments.push({
+          varName: obj.varName,
+          propKey: p.k,
+          propVal: p.v,
+          propType: p.t,
+        });
+      }
+    });
+  });
+
+  return {
+    orderedObjects,
+    deferredAssignments,
+  };
+}
+
+/**
+ * Topologically sort objects so that dependencies / Media resources are declared before usage
+ */
+export function getSortedObjects(objects: WherigoObject[]): WherigoObject[] {
+  return processObjectsForLua(objects).orderedObjects;
 }
 
 /**
@@ -63,16 +218,28 @@ export function generateCartridgeLuaScript(cart: Cartridge): string {
   sb += `Cartridge.Author = "${escapeLua(cart.author)}"\n\n`;
 
   sb += '-- Constructed Persistent Objects & Inventories\n';
-  const sortedObjs = getSortedObjects(cart.objects);
-  sortedObjs.forEach((obj) => {
+  const { orderedObjects, deferredAssignments } = processObjectsForLua(cart.objects);
+
+  const deferredKeysSet = new Set<string>();
+  deferredAssignments.forEach((d) => deferredKeysSet.add(`${d.varName}:${d.propKey}`));
+
+  orderedObjects.forEach((obj) => {
     sb += `${obj.varName} = ${obj.constructor || '{}'}\n`;
     obj.props.forEach((p) => {
-      if (p.k) {
+      if (p.k && !deferredKeysSet.has(`${obj.varName}:${p.k}`)) {
         sb += `${obj.varName}.${p.k} = ${formatPropertyValue(p.v, p.t)}\n`;
       }
     });
     sb += '\n';
   });
+
+  if (deferredAssignments.length > 0) {
+    sb += '-- Resolved Circular Dependencies\n';
+    deferredAssignments.forEach((d) => {
+      sb += `${d.varName}.${d.propKey} = ${formatPropertyValue(d.propVal, d.propType)}\n`;
+    });
+    sb += '\n';
+  }
 
   sb += 'function OnStart()\n';
   sb += `    Wherigo.MessageBox({Text = "Welcome to ${escapeLua(cart.name)}!"})\n`;
